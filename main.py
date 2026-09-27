@@ -152,22 +152,40 @@ class SummerTemplateBot2026(ForecastBot):
     # Web-search model that looks up base rates before the news is read. Set
     # after construction; None skips that step.
     base_rate_researcher: GeneralLlm | None = None
+    # Also pull news articles from AskNews, on top of the web search.
+    use_asknews: bool = False
 
     ##################################### RESEARCH #####################################
 
     async def run_research(self, question: MetaculusQuestion) -> str:
         async with self._concurrency_limiter:
-            news, base_rates = await asyncio.gather(
-                self._research_news(question), self._research_base_rates(question)
+            news, articles, base_rates = await asyncio.gather(
+                self._research_news(question),
+                self._research_asknews(question),
+                self._research_base_rates(question),
             )
-            research = news
-            if base_rates:
-                research = (
-                    f"## Base rates (how often things like this happen)\n{base_rates}\n\n"
-                    f"## Current news about this question\n{news}"
-                )
+            sections = [
+                ("Base rates (how often things like this happen)", base_rates),
+                ("Current news about this question", news),
+                ("Recent news articles (AskNews)", articles),
+            ]
+            research = "\n\n".join(
+                f"## {title}\n{text}" for title, text in sections if text
+            )
             logger.info(f"Found Research for URL {question.page_url}:\n{research}")
             return research
+
+    async def _research_asknews(self, question: MetaculusQuestion) -> str:
+        if not self.use_asknews:
+            return ""
+        try:
+            return await AskNewsSearcher().get_formatted_news_async(
+                question.question_text
+            )
+        except Exception as e:
+            # A second news source helps but isn't essential.
+            logger.warning(f"AskNews research failed for {question.page_url}: {e}")
+            return ""
 
     async def _research_base_rates(self, question: MetaculusQuestion) -> str:
         if self.base_rate_researcher is None:
@@ -812,17 +830,18 @@ def pick_llms(forecaster: str, providers: set[str]) -> dict:
         if "anthropic" in providers
         else "openai/gpt-4o-mini"
     )
-    if _is_real_env("ASKNEWS_CLIENT_ID") and _is_real_env("ASKNEWS_SECRET"):
-        researcher = "asknews/news-summaries"
-    else:
-        researcher = make_search_llm(providers)
-
     return {
         "default": make_forecaster(forecaster),
         "summarizer": helper,
-        "researcher": researcher,
+        "researcher": make_search_llm(providers),
         "parser": helper,
     }
+
+
+def asknews_configured() -> bool:
+    return _is_real_env("ASKNEWS_API_KEY") or (
+        _is_real_env("ASKNEWS_CLIENT_ID") and _is_real_env("ASKNEWS_SECRET")
+    )
 
 
 if __name__ == "__main__":
@@ -887,6 +906,7 @@ if __name__ == "__main__":
     print(
         f"Forecasting models: {', '.join(forecast_models)} "
         f"({forecasts_per_question} forecasts per question)\n"
+        f"Research: web search + base rates{' + AskNews' if asknews_configured() else ''}\n"
     )
 
     # The locked forecasting-tools (0.2.92) still points its "current" IDs at
@@ -911,6 +931,7 @@ if __name__ == "__main__":
     if len(forecast_models) > 1:
         template_bot.forecasters = [make_forecaster(m) for m in forecast_models]
     template_bot.base_rate_researcher = make_search_llm(providers)
+    template_bot.use_asknews = asknews_configured()
 
     # Per-mode tournament URL shown in the summary banner footer. These
     # piggyback on the forecasting_tools SDK constants and need updating
