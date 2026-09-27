@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import logging
+import os
 from datetime import datetime, timezone
 from typing import Literal
 
@@ -8,6 +9,7 @@ import dotenv
 
 # Runtime helpers (env validation, banners, dependency-warning suppression).
 from bot_helpers import (
+    _is_real_env,
     check_environment,
     print_run_summary_banner,
     print_startup_banner,
@@ -646,6 +648,50 @@ class SummerTemplateBot2026(ForecastBot):
         )
 
 
+def pick_llms(forecaster: str | None) -> dict:
+    """
+    Pin current models instead of forecasting-tools' GPT-4o-era defaults, and
+    pick providers only from keys that are really set (placeholders like
+    REPLACE_ME count as unset).
+    """
+    if not forecaster:
+        forecaster = (
+            "anthropic/claude-opus-5"
+            if _is_real_env("ANTHROPIC_API_KEY")
+            else "openai/gpt-5.4"
+        )
+    # Claude needs room for its thinking plus the written answer.
+    forecaster_kwargs = {"max_tokens": 16000} if forecaster.startswith("anthropic/") else {}
+
+    helper = (
+        "openai/gpt-4o-mini"
+        if _is_real_env("OPENAI_API_KEY")
+        else "anthropic/claude-haiku-4-5"
+    )
+    # The library's OpenAI default researcher (gpt-4o-search-preview) has been
+    # retired by OpenAI and fails every question, so choose a live one.
+    if _is_real_env("ASKNEWS_CLIENT_ID") and _is_real_env("ASKNEWS_SECRET"):
+        researcher = "asknews/news-summaries"
+    elif _is_real_env("ANTHROPIC_API_KEY"):
+        researcher = GeneralLlm(
+            model="anthropic/claude-sonnet-5",
+            max_tokens=4000,
+            timeout=180,
+            web_search_options={"search_context_size": "medium"},
+        )
+    else:
+        researcher = GeneralLlm(model="openai/gpt-5-search-api", timeout=180)
+
+    return {
+        "default": GeneralLlm(
+            model=forecaster, timeout=300, allowed_tries=2, **forecaster_kwargs
+        ),
+        "summarizer": helper,
+        "researcher": researcher,
+        "parser": helper,
+    }
+
+
 if __name__ == "__main__":
     logging.basicConfig(
         level=logging.INFO,
@@ -660,12 +706,37 @@ if __name__ == "__main__":
         default="tournament",
         help="What to forecast on (default: tournament)",
     )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Forecast without submitting anything to Metaculus; save reports to ./reports",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="test_questions mode only: forecast just the first N practice questions",
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=os.getenv("FORECAST_MODEL") or None,
+        help="Forecasting model, e.g. anthropic/claude-opus-5 or openai/gpt-5.4 "
+        "(default: FORECAST_MODEL env var, else picked from your keys)",
+    )
     args = parser.parse_args()
     run_mode: Literal["tournament", "metaculus_cup", "test_questions"] = args.mode
 
     check_environment(strict=True)
-    publish_to_metaculus = True
+    publish_to_metaculus = not args.dry_run
     print_startup_banner(run_mode, will_publish=publish_to_metaculus)
+    llms = pick_llms(args.model)
+    print(f"Forecasting model: {llms['default'].model}\n")
+
+    # The locked forecasting-tools (0.2.92) still points its "current" IDs at
+    # the Summer 2026 season, so pin the Fall 2026 tournaments here.
+    FALL_2026_TOURNAMENT_ID = 33121  # https://www.metaculus.com/tournament/fall-futureeval-2026/
+    METACULUS_CUP_FALL_2026_ID = 33108  # https://www.metaculus.com/tournament/metaculus-cup-fall-2026/
 
     # Configure the bot. The `llms=` block below is commented out to use
     # whichever default models forecasting-tools picks based on your env vars;
@@ -675,28 +746,20 @@ if __name__ == "__main__":
         predictions_per_research_report=5,
         use_research_summary_to_forecast=False,
         publish_reports_to_metaculus=publish_to_metaculus,
-        folder_to_save_reports_to=None,
+        folder_to_save_reports_to=(
+            "reports/" + (llms["default"].model.replace("/", "_")) if args.dry_run else None
+        ),
         skip_previously_forecasted_questions=True,
         extra_metadata_in_explanation=True,
-        # llms={
-        #     "default": GeneralLlm(
-        #         model="openrouter/openai/gpt-4o",
-        #         temperature=0.3,
-        #         timeout=40,
-        #         allowed_tries=2,
-        #     ),
-        #     "summarizer": "openai/gpt-4o-mini",
-        #     "researcher": "asknews/news-summaries",
-        #     "parser": "openai/gpt-4o-mini",
-        # },
+        llms=llms,
     )
 
     # Per-mode tournament URL shown in the summary banner footer. These
     # piggyback on the forecasting_tools SDK constants and need updating
     # whenever those rotate seasons.
     TOURNAMENT_URLS = {
-        "tournament": "https://www.metaculus.com/tournament/summer-futureeval-2026/",
-        "metaculus_cup": "https://www.metaculus.com/tournament/metaculus-cup-summer-2025/",
+        "tournament": "https://www.metaculus.com/tournament/fall-futureeval-2026/",
+        "metaculus_cup": "https://www.metaculus.com/tournament/metaculus-cup-fall-2026/",
         "test_questions": "https://www.metaculus.com/tournament/bot-testing-area/",
     }
 
@@ -707,7 +770,7 @@ if __name__ == "__main__":
     if run_mode == "tournament":
         seasonal_tournament_reports = asyncio.run(
             template_bot.forecast_on_tournament(
-                client.CURRENT_AI_COMPETITION_ID, return_exceptions=True
+                FALL_2026_TOURNAMENT_ID, return_exceptions=True
             )
         )
         minibench_reports = asyncio.run(
@@ -723,7 +786,7 @@ if __name__ == "__main__":
         template_bot.skip_previously_forecasted_questions = False
         forecast_reports = asyncio.run(
             template_bot.forecast_on_tournament(
-                client.CURRENT_METACULUS_CUP_ID, return_exceptions=True
+                METACULUS_CUP_FALL_2026_ID, return_exceptions=True
             )
         )
     elif run_mode == "test_questions":
@@ -731,11 +794,21 @@ if __name__ == "__main__":
         # the recommended target for smoke-testing your bot.
         # https://www.metaculus.com/tournament/bot-testing-area/
         template_bot.skip_previously_forecasted_questions = False
-        forecast_reports = asyncio.run(
-            template_bot.forecast_on_tournament(
-                "bot-testing-area", return_exceptions=True
+        if args.limit:
+            practice_questions = client.get_all_open_questions_from_tournament(
+                "bot-testing-area"
+            )[: args.limit]
+            forecast_reports = asyncio.run(
+                template_bot.forecast_questions(
+                    practice_questions, return_exceptions=True
+                )
             )
-        )
+        else:
+            forecast_reports = asyncio.run(
+                template_bot.forecast_on_tournament(
+                    "bot-testing-area", return_exceptions=True
+                )
+            )
 
     template_bot.log_report_summary(forecast_reports)
     print_run_summary_banner(

@@ -2,8 +2,9 @@ name: Forecast on Metaculus Cup
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "0 0 */2 * *" # runs at midnight every 2 days
+  # Schedule turned off: bots cannot win prizes in the Metaculus Cup, so it only spends credits.
+  # schedule:
+  #   - cron: "0 0 */2 * *" # runs at midnight every 2 days
 
 # Add concurrency group to prevent parallel runs
 concurrency:
