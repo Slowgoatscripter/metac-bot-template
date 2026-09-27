@@ -131,6 +131,24 @@ class SummerTemplateBot2026(ForecastBot):
     _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
     _structure_output_validation_samples = 2
 
+    # Forecasting models to take turns with, one per forecast. Set after
+    # construction; empty means every forecast uses llms["default"]. With two
+    # models and an even number of forecasts per question, each question gets
+    # an equal share from each model, and the median blends them.
+    forecasters: list[GeneralLlm] = []
+
+    def _next_forecaster(self, question: MetaculusQuestion) -> GeneralLlm:
+        if not self.forecasters:
+            return self.get_llm("default", "llm")
+        # Count per question: questions are forecast concurrently, so a single
+        # shared counter could hand one question an uneven mix.
+        turns = self.__dict__.setdefault("_forecaster_turns", {})
+        turn = turns.get(question.page_url, 0)
+        turns[question.page_url] = turn + 1
+        llm = self.forecasters[turn % len(self.forecasters)]
+        logger.info(f"Forecast {turn + 1} for {question.page_url} uses {llm.model}")
+        return llm
+
     ##################################### RESEARCH #####################################
 
     async def run_research(self, question: MetaculusQuestion) -> str:
@@ -230,7 +248,7 @@ class SummerTemplateBot2026(ForecastBot):
         question: BinaryQuestion,
         prompt: str,
     ) -> ReasonedPrediction[float]:
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
+        reasoning = await self._next_forecaster(question).invoke(prompt)
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
         binary_prediction: BinaryPrediction = await structure_output(
             reasoning,
@@ -304,7 +322,7 @@ class SummerTemplateBot2026(ForecastBot):
             Additionally, you may sometimes need to parse a 0% probability. Please do not skip options with 0% but rather make it an entry in your final list with 0% probability.
             """
         )
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
+        reasoning = await self._next_forecaster(question).invoke(prompt)
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
         predicted_option_list: PredictedOptionList = await structure_output(
             text_to_structure=reasoning,
@@ -387,7 +405,7 @@ class SummerTemplateBot2026(ForecastBot):
         question: NumericQuestion,
         prompt: str,
     ) -> ReasonedPrediction[NumericDistribution]:
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
+        reasoning = await self._next_forecaster(question).invoke(prompt)
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
         parsing_instructions = clean_indents(
             f"""
@@ -481,7 +499,7 @@ class SummerTemplateBot2026(ForecastBot):
         question: DateQuestion,
         prompt: str,
     ) -> ReasonedPrediction[NumericDistribution]:
-        reasoning = await self.get_llm("default", "llm").invoke(prompt)
+        reasoning = await self._next_forecaster(question).invoke(prompt)
         logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
         parsing_instructions = clean_indents(
             f"""
@@ -648,21 +666,33 @@ class SummerTemplateBot2026(ForecastBot):
         )
 
 
-def pick_llms(forecaster: str | None) -> dict:
+def make_forecaster(model: str) -> GeneralLlm:
+    kwargs: dict = {}
+    if model.startswith("anthropic/"):
+        # Claude needs room for its thinking plus the written answer.
+        kwargs["max_tokens"] = 16000
+        if "opus-5-5" in model:
+            # Opus 5.5 defaults to medium effort; forecasting deserves high.
+            kwargs["output_config"] = {"effort": "high"}
+    return GeneralLlm(model=model, timeout=300, allowed_tries=2, **kwargs)
+
+
+def default_forecast_models() -> list[str]:
+    """One forecasting model per provider whose key is really set."""
+    models = []
+    if _is_real_env("ANTHROPIC_API_KEY"):
+        models.append("anthropic/claude-opus-5-5")
+    if _is_real_env("OPENAI_API_KEY"):
+        models.append("openai/gpt-6-astra")
+    return models or ["openai/gpt-5.4"]
+
+
+def pick_llms(forecaster: str) -> dict:
     """
     Pin current models instead of forecasting-tools' GPT-4o-era defaults, and
     pick providers only from keys that are really set (placeholders like
     REPLACE_ME count as unset).
     """
-    if not forecaster:
-        forecaster = (
-            "anthropic/claude-opus-5"
-            if _is_real_env("ANTHROPIC_API_KEY")
-            else "openai/gpt-5.4"
-        )
-    # Claude needs room for its thinking plus the written answer.
-    forecaster_kwargs = {"max_tokens": 16000} if forecaster.startswith("anthropic/") else {}
-
     helper = (
         "openai/gpt-4o-mini"
         if _is_real_env("OPENAI_API_KEY")
@@ -683,9 +713,7 @@ def pick_llms(forecaster: str | None) -> dict:
         researcher = GeneralLlm(model="openai/gpt-5-search-api", timeout=180)
 
     return {
-        "default": GeneralLlm(
-            model=forecaster, timeout=300, allowed_tries=2, **forecaster_kwargs
-        ),
+        "default": make_forecaster(forecaster),
         "summarizer": helper,
         "researcher": researcher,
         "parser": helper,
@@ -721,8 +749,9 @@ if __name__ == "__main__":
         "--model",
         type=str,
         default=os.getenv("FORECAST_MODEL") or None,
-        help="Forecasting model, e.g. anthropic/claude-opus-5 or openai/gpt-5.4 "
-        "(default: FORECAST_MODEL env var, else picked from your keys)",
+        help="Forecasting model(s), comma-separated to take turns, e.g. "
+        "anthropic/claude-opus-5-5,openai/gpt-6-astra "
+        "(default: FORECAST_MODEL env var, else one model per provider key)",
     )
     args = parser.parse_args()
     run_mode: Literal["tournament", "metaculus_cup", "test_questions"] = args.mode
@@ -730,29 +759,41 @@ if __name__ == "__main__":
     check_environment(strict=True)
     publish_to_metaculus = not args.dry_run
     print_startup_banner(run_mode, will_publish=publish_to_metaculus)
-    llms = pick_llms(args.model)
-    print(f"Forecasting model: {llms['default'].model}\n")
+    forecast_models = (
+        [m.strip() for m in args.model.split(",") if m.strip()]
+        if args.model
+        else default_forecast_models()
+    )
+    llms = pick_llms(forecast_models[0])
+    # One model: the template's 5 forecasts. Several: 2 each, so the median
+    # blends them evenly.
+    forecasts_per_question = 5 if len(forecast_models) == 1 else 2 * len(forecast_models)
+    print(
+        f"Forecasting models: {', '.join(forecast_models)} "
+        f"({forecasts_per_question} forecasts per question)\n"
+    )
 
     # The locked forecasting-tools (0.2.92) still points its "current" IDs at
     # the Summer 2026 season, so pin the Fall 2026 tournaments here.
     FALL_2026_TOURNAMENT_ID = 33121  # https://www.metaculus.com/tournament/fall-futureeval-2026/
     METACULUS_CUP_FALL_2026_ID = 33108  # https://www.metaculus.com/tournament/metaculus-cup-fall-2026/
 
-    # Configure the bot. The `llms=` block below is commented out to use
-    # whichever default models forecasting-tools picks based on your env vars;
-    # uncomment and edit to pin specific models.
     template_bot = SummerTemplateBot2026(
         research_reports_per_question=1,
-        predictions_per_research_report=5,
+        predictions_per_research_report=forecasts_per_question,
         use_research_summary_to_forecast=False,
         publish_reports_to_metaculus=publish_to_metaculus,
         folder_to_save_reports_to=(
-            "reports/" + (llms["default"].model.replace("/", "_")) if args.dry_run else None
+            "reports/" + "+".join(m.split("/")[-1] for m in forecast_models)
+            if args.dry_run
+            else None
         ),
         skip_previously_forecasted_questions=True,
         extra_metadata_in_explanation=True,
         llms=llms,
     )
+    if len(forecast_models) > 1:
+        template_bot.forecasters = [make_forecaster(m) for m in forecast_models]
 
     # Per-mode tournament URL shown in the summary banner footer. These
     # piggyback on the forecasting_tools SDK constants and need updating
@@ -773,11 +814,16 @@ if __name__ == "__main__":
                 FALL_2026_TOURNAMENT_ID, return_exceptions=True
             )
         )
-        minibench_reports = asyncio.run(
-            template_bot.forecast_on_tournament(
-                client.CURRENT_MINIBENCH_ID, return_exceptions=True
+        # MiniBench is off unless INCLUDE_MINIBENCH is set: its prizes are
+        # small and it roughly doubles the number of questions to pay for.
+        if os.getenv("INCLUDE_MINIBENCH", "").strip().lower() in ("1", "true", "yes"):
+            minibench_reports = asyncio.run(
+                template_bot.forecast_on_tournament(
+                    client.CURRENT_MINIBENCH_ID, return_exceptions=True
+                )
             )
-        )
+        else:
+            minibench_reports = []
         forecast_reports = seasonal_tournament_reports + minibench_reports
     elif run_mode == "metaculus_cup":
         # The Metaculus Cup may be uninitialized near the start of a season
