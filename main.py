@@ -149,57 +149,109 @@ class SummerTemplateBot2026(ForecastBot):
         logger.info(f"Forecast {turn + 1} for {question.page_url} uses {llm.model}")
         return llm
 
+    # Web-search model that looks up base rates before the news is read. Set
+    # after construction; None skips that step.
+    base_rate_researcher: GeneralLlm | None = None
+
     ##################################### RESEARCH #####################################
 
     async def run_research(self, question: MetaculusQuestion) -> str:
         async with self._concurrency_limiter:
-            research = ""
-            researcher = self.get_llm("researcher")
-
-            prompt = clean_indents(
-                f"""
-                You are an assistant to a superforecaster.
-                The superforecaster will give you a question they intend to forecast on.
-                To be a great assistant, you generate a concise but detailed rundown of the most relevant news, including if the question would resolve Yes or No based on current information.
-                You do not produce forecasts yourself.
-
-                Question:
-                {question.question_text}
-
-                This question's outcome will be determined by the specific criteria below:
-                {question.resolution_criteria}
-
-                {question.fine_print}
-                """
+            news, base_rates = await asyncio.gather(
+                self._research_news(question), self._research_base_rates(question)
             )
-
-            if isinstance(researcher, GeneralLlm):
-                research = await researcher.invoke(prompt)
-            elif (
-                researcher == "asknews/news-summaries"
-                or researcher == "asknews/deep-research/low-depth"
-                or researcher == "asknews/deep-research/medium-depth"
-                or researcher == "asknews/deep-research/high-depth"
-            ):
-                research = await AskNewsSearcher().call_preconfigured_version(
-                    researcher, prompt
+            research = news
+            if base_rates:
+                research = (
+                    f"## Base rates (how often things like this happen)\n{base_rates}\n\n"
+                    f"## Current news about this question\n{news}"
                 )
-            elif researcher.startswith("smart-searcher"):
-                model_name = researcher.removeprefix("smart-searcher/")
-                searcher = SmartSearcher(
-                    model=model_name,
-                    temperature=0,
-                    num_searches_to_run=2,
-                    num_sites_per_search=10,
-                    use_advanced_filters=False,
-                )
-                research = await searcher.invoke(prompt)
-            elif not researcher or researcher == "None" or researcher == "no_research":
-                research = ""
-            else:
-                research = await self.get_llm("researcher", "llm").invoke(prompt)
             logger.info(f"Found Research for URL {question.page_url}:\n{research}")
             return research
+
+    async def _research_base_rates(self, question: MetaculusQuestion) -> str:
+        if self.base_rate_researcher is None:
+            return ""
+        resolves = (
+            question.scheduled_resolution_time.strftime("%Y-%m-%d")
+            if question.scheduled_resolution_time
+            else "unknown"
+        )
+        prompt = clean_indents(
+            f"""
+            You are an assistant to a superforecaster. Your job is the outside view: before anyone looks at the specifics of this question, how often do events like this one happen?
+
+            Question:
+            {question.question_text}
+
+            This question's outcome will be determined by the specific criteria below:
+            {question.resolution_criteria}
+
+            {question.fine_print}
+
+            Today is {datetime.now().strftime("%Y-%m-%d")}. The question is scheduled to resolve on {resolves}.
+
+            1. Name one to three reference classes: groups of past situations comparable to this one (for example "US midterm elections since 1946" or "monthly US CPI releases over the last 10 years").
+            2. For each, search for the historical record and give the base rate as a number with its source. Match the time window to this question: if it resolves in 3 months, say how often the outcome happens within a 3-month window. For numeric or date questions, give the typical values and how much they usually move over a period that long.
+            3. Say which reference class fits best and why, and note anything that makes this case unusual.
+
+            Do not forecast this question and do not summarize current news; another assistant covers the news. If no sensible reference class exists, say so in one sentence.
+            """
+        )
+        try:
+            return await self.base_rate_researcher.invoke(prompt)
+        except Exception as e:
+            # Base rates help but aren't essential; forecast on the news alone.
+            logger.warning(f"Base-rate research failed for {question.page_url}: {e}")
+            return ""
+
+    async def _research_news(self, question: MetaculusQuestion) -> str:
+        research = ""
+        researcher = self.get_llm("researcher")
+
+        prompt = clean_indents(
+            f"""
+            You are an assistant to a superforecaster.
+            The superforecaster will give you a question they intend to forecast on.
+            To be a great assistant, you generate a concise but detailed rundown of the most relevant news, including if the question would resolve Yes or No based on current information.
+            You do not produce forecasts yourself.
+
+            Question:
+            {question.question_text}
+
+            This question's outcome will be determined by the specific criteria below:
+            {question.resolution_criteria}
+
+            {question.fine_print}
+            """
+        )
+
+        if isinstance(researcher, GeneralLlm):
+            research = await researcher.invoke(prompt)
+        elif (
+            researcher == "asknews/news-summaries"
+            or researcher == "asknews/deep-research/low-depth"
+            or researcher == "asknews/deep-research/medium-depth"
+            or researcher == "asknews/deep-research/high-depth"
+        ):
+            research = await AskNewsSearcher().call_preconfigured_version(
+                researcher, prompt
+            )
+        elif researcher.startswith("smart-searcher"):
+            model_name = researcher.removeprefix("smart-searcher/")
+            searcher = SmartSearcher(
+                model=model_name,
+                temperature=0,
+                num_searches_to_run=2,
+                num_sites_per_search=10,
+                use_advanced_filters=False,
+            )
+            research = await searcher.invoke(prompt)
+        elif not researcher or researcher == "None" or researcher == "no_research":
+            research = ""
+        else:
+            research = await self.get_llm("researcher", "llm").invoke(prompt)
+        return research
 
     ##################################### BINARY QUESTIONS #####################################
 
@@ -229,12 +281,13 @@ class SummerTemplateBot2026(ForecastBot):
             Today is {datetime.now().strftime("%Y-%m-%d")}.
 
             Before answering you write:
-            (a) The time left until the outcome to the question is known.
-            (b) The status quo outcome if nothing changed.
-            (c) A brief description of a scenario that results in a No outcome.
-            (d) A brief description of a scenario that results in a Yes outcome.
+            (a) The base rate: the reference class from your research assistant that fits this question best, and how often the outcome happens in it over a similar length of time.
+            (b) The time left until the outcome to the question is known.
+            (c) The status quo outcome if nothing changed.
+            (d) A brief description of a scenario that results in a No outcome.
+            (e) A brief description of a scenario that results in a Yes outcome.
 
-            You write your rationale remembering that good forecasters put extra weight on the status quo outcome since the world changes slowly most of the time.
+            You write your rationale remembering that good forecasters start from the base rate and adjust it for what is specific to this case, and put extra weight on the status quo outcome since the world changes slowly most of the time.
             {self._get_conditional_disclaimer_if_necessary(question)}
 
             The last thing you write is your final answer as: "Probability: ZZ%", 0-100
@@ -292,12 +345,13 @@ class SummerTemplateBot2026(ForecastBot):
             Today is {datetime.now().strftime("%Y-%m-%d")}.
 
             Before answering you write:
-            (a) The time left until the outcome to the question is known.
-            (b) The status quo outcome if nothing changed.
-            (c) A description of an scenario that results in an unexpected outcome.
+            (a) The base rate: the reference class from your research assistant that fits this question best, and how often each kind of outcome happens in it.
+            (b) The time left until the outcome to the question is known.
+            (c) The status quo outcome if nothing changed.
+            (d) A description of an scenario that results in an unexpected outcome.
 
             {self._get_conditional_disclaimer_if_necessary(question)}
-            You write your rationale remembering that (1) good forecasters put extra weight on the status quo outcome since the world changes slowly most of the time, and (2) good forecasters leave some moderate probability on most options to account for unexpected outcomes.
+            You write your rationale remembering that (1) good forecasters start from the base rate and adjust it for what is specific to this case, (2) good forecasters put extra weight on the status quo outcome since the world changes slowly most of the time, and (3) good forecasters leave some moderate probability on most options to account for unexpected outcomes.
 
             The last thing you write is your final probabilities for the N options in this order {question.options} as:
             Option_A: Probability_A
@@ -377,15 +431,16 @@ class SummerTemplateBot2026(ForecastBot):
             - Always start with a smaller number (more negative if negative) and then increase from there. The value for percentile 10 should always be less than the value for percentile 20, and so on.
 
             Before answering you write:
-            (a) The time left until the outcome to the question is known.
-            (b) The outcome if nothing changed.
-            (c) The outcome if the current trend continued.
-            (d) The expectations of experts and markets.
-            (e) A brief description of an unexpected scenario that results in a low outcome.
-            (f) A brief description of an unexpected scenario that results in a high outcome.
+            (a) The base rate: what the historical record from your research assistant says about typical outcomes and how much they usually move over a similar length of time.
+            (b) The time left until the outcome to the question is known.
+            (c) The outcome if nothing changed.
+            (d) The outcome if the current trend continued.
+            (e) The expectations of experts and markets.
+            (f) A brief description of an unexpected scenario that results in a low outcome.
+            (g) A brief description of an unexpected scenario that results in a high outcome.
 
             {self._get_conditional_disclaimer_if_necessary(question)}
-            You remind yourself that good forecasters are humble and set wide 90/10 confidence intervals to account for unknown unknowns.
+            You remind yourself that good forecasters start from the base rate and adjust it for what is specific to this case, and that they are humble and set wide 90/10 confidence intervals to account for unknown unknowns.
 
             The last thing you write is your final answer as:
             "
@@ -470,15 +525,16 @@ class SummerTemplateBot2026(ForecastBot):
             - Do NOT forget this. The dates must be written in chronological order starting at the earliest time at percentile 10 and increasing from there.
 
             Before answering you write:
-            (a) The time left until the outcome to the question is known.
-            (b) The outcome if nothing changed.
-            (c) The outcome if the current trend continued.
-            (d) The expectations of experts and markets.
-            (e) A brief description of an unexpected scenario that results in a low outcome.
-            (f) A brief description of an unexpected scenario that results in a high outcome.
+            (a) The base rate: what the historical record from your research assistant says about typical outcomes and how much they usually move over a similar length of time.
+            (b) The time left until the outcome to the question is known.
+            (c) The outcome if nothing changed.
+            (d) The outcome if the current trend continued.
+            (e) The expectations of experts and markets.
+            (f) A brief description of an unexpected scenario that results in a low outcome.
+            (g) A brief description of an unexpected scenario that results in a high outcome.
 
             {self._get_conditional_disclaimer_if_necessary(question)}
-            You remind yourself that good forecasters are humble and set wide 90/10 confidence intervals to account for unknown unknowns.
+            You remind yourself that good forecasters start from the base rate and adjust it for what is specific to this case, and that they are humble and set wide 90/10 confidence intervals to account for unknown unknowns.
 
             The last thing you write is your final answer as:
             "
@@ -677,40 +733,89 @@ def make_forecaster(model: str) -> GeneralLlm:
     return GeneralLlm(model=model, timeout=300, allowed_tries=2, **kwargs)
 
 
-def default_forecast_models() -> list[str]:
-    """One forecasting model per provider whose key is really set."""
+# Provider -> (key variable, cheap model to test the key with).
+PROVIDERS = {
+    "anthropic": ("ANTHROPIC_API_KEY", "anthropic/claude-haiku-4-5"),
+    "openai": ("OPENAI_API_KEY", "openai/gpt-4o-mini"),
+}
+
+
+def working_providers() -> set[str]:
+    """
+    Providers whose key is set and answers a tiny test call. A mistyped key or
+    an empty credit balance on one provider then costs only that provider's
+    forecasts instead of failing every question.
+    """
+
+    async def ping(model: str) -> str | None:
+        try:
+            await GeneralLlm(model=model, max_tokens=5, timeout=60).invoke("Reply OK.")
+            return None
+        except Exception as e:
+            return f"{type(e).__name__}: {str(e)[:300]}"
+
+    async def ping_all() -> list[str | None]:
+        return await asyncio.gather(*(ping(m) for m in candidates.values()))
+
+    candidates = {
+        name: model
+        for name, (key_var, model) in PROVIDERS.items()
+        if _is_real_env(key_var)
+    }
+    working = set()
+    for name, error in zip(candidates, asyncio.run(ping_all())):
+        if error:
+            logger.error(f"Skipping {name} this run; its API key failed a test call: {error}")
+        else:
+            working.add(name)
+    return working
+
+
+def uses_working_provider(model: str, providers: set[str]) -> bool:
+    provider = model.split("/")[0]
+    return provider not in PROVIDERS or provider in providers
+
+
+def default_forecast_models(providers: set[str]) -> list[str]:
+    """One forecasting model per working provider."""
     models = []
-    if _is_real_env("ANTHROPIC_API_KEY"):
+    if "anthropic" in providers:
         models.append("anthropic/claude-opus-5-5")
-    if _is_real_env("OPENAI_API_KEY"):
+    if "openai" in providers:
         models.append("openai/gpt-6-astra")
-    return models or ["openai/gpt-5.4"]
+    return models
 
 
-def pick_llms(forecaster: str) -> dict:
-    """
-    Pin current models instead of forecasting-tools' GPT-4o-era defaults, and
-    pick providers only from keys that are really set (placeholders like
-    REPLACE_ME count as unset).
-    """
-    helper = (
-        "openai/gpt-4o-mini"
-        if _is_real_env("OPENAI_API_KEY")
-        else "anthropic/claude-haiku-4-5"
-    )
+def make_search_llm(providers: set[str]) -> GeneralLlm:
     # The library's OpenAI default researcher (gpt-4o-search-preview) has been
     # retired by OpenAI and fails every question, so choose a live one.
-    if _is_real_env("ASKNEWS_CLIENT_ID") and _is_real_env("ASKNEWS_SECRET"):
-        researcher = "asknews/news-summaries"
-    elif _is_real_env("ANTHROPIC_API_KEY"):
-        researcher = GeneralLlm(
+    if "anthropic" in providers:
+        return GeneralLlm(
             model="anthropic/claude-sonnet-5",
             max_tokens=4000,
             timeout=180,
             web_search_options={"search_context_size": "medium"},
         )
+    return GeneralLlm(model="openai/gpt-5-search-api", timeout=180)
+
+
+def pick_llms(forecaster: str, providers: set[str]) -> dict:
+    """
+    Pin current models instead of forecasting-tools' GPT-4o-era defaults,
+    using only providers that passed the startup test.
+    """
+    # The parser reads the final number out of every forecast, so it runs on
+    # Anthropic, which holds most of the credit; OpenAI's small balance
+    # running dry mid-run then loses only the OpenAI forecasts.
+    helper = (
+        "anthropic/claude-haiku-4-5"
+        if "anthropic" in providers
+        else "openai/gpt-4o-mini"
+    )
+    if _is_real_env("ASKNEWS_CLIENT_ID") and _is_real_env("ASKNEWS_SECRET"):
+        researcher = "asknews/news-summaries"
     else:
-        researcher = GeneralLlm(model="openai/gpt-5-search-api", timeout=180)
+        researcher = make_search_llm(providers)
 
     return {
         "default": make_forecaster(forecaster),
@@ -759,12 +864,23 @@ if __name__ == "__main__":
     check_environment(strict=True)
     publish_to_metaculus = not args.dry_run
     print_startup_banner(run_mode, will_publish=publish_to_metaculus)
+    providers = working_providers()
+    if not providers:
+        raise SystemExit(
+            "No AI provider passed the startup test (see errors above). "
+            "Check the OPENAI_API_KEY / ANTHROPIC_API_KEY secrets and credit balances."
+        )
     forecast_models = (
         [m.strip() for m in args.model.split(",") if m.strip()]
         if args.model
-        else default_forecast_models()
+        else default_forecast_models(providers)
     )
-    llms = pick_llms(forecast_models[0])
+    forecast_models = [m for m in forecast_models if uses_working_provider(m, providers)]
+    if not forecast_models:
+        raise SystemExit(
+            f"None of the chosen forecasting models run on a working provider ({', '.join(sorted(providers))})."
+        )
+    llms = pick_llms(forecast_models[0], providers)
     # One model: the template's 5 forecasts. Several: 2 each, so the median
     # blends them evenly.
     forecasts_per_question = 5 if len(forecast_models) == 1 else 2 * len(forecast_models)
@@ -794,6 +910,7 @@ if __name__ == "__main__":
     )
     if len(forecast_models) > 1:
         template_bot.forecasters = [make_forecaster(m) for m in forecast_models]
+    template_bot.base_rate_researcher = make_search_llm(providers)
 
     # Per-mode tournament URL shown in the summary banner footer. These
     # piggyback on the forecasting_tools SDK constants and need updating
