@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from typing import Literal
 
 import dotenv
+import httpx
 
 # Runtime helpers (env validation, banners, dependency-warning suppression).
 from bot_helpers import (
@@ -45,6 +46,93 @@ from forecasting_tools import (
 
 dotenv.load_dotenv()
 logger = logging.getLogger(__name__)
+
+
+# Research instructions. They double as Perplexity Agent API `instructions`
+# (its prompt guide: short, rules not examples, permission to report gaps)
+# and as the start of the backup web-search prompt.
+NEWS_INSTRUCTIONS = """You are a research assistant to a superforecaster. The input is a forecasting question with its resolution criteria. Report the facts a forecaster needs; do not forecast.
+
+Cover:
+- Where things stand today, and whether the question would resolve Yes or No if it resolved now.
+- The latest developments, with the date of each.
+- Scheduled events before the resolution date that could decide it, such as votes, data releases or deadlines.
+- Current prices on prediction markets such as Polymarket or Kalshi, and forecasts by experts or models, with their dates.
+
+Rules:
+- Give concrete numbers and dates rather than vague qualifiers.
+- Never report Metaculus community forecasts.
+- If searches find nothing relevant after trying other phrasings, say so plainly instead of guessing.
+- Keep it under 500 words."""
+
+BASE_RATE_INSTRUCTIONS = """You are a research assistant to a superforecaster, responsible for the outside view: how often events like the one in the question happen, before looking at the specifics of this case. The input is a forecasting question with its resolution criteria.
+
+Cover:
+- One to three reference classes: groups of past situations comparable to this one.
+- For each, the historical base rate as a number, over a time window matching the time left until the question resolves. For numeric or date questions, give the typical values and how much they usually move over a period that long.
+- Which reference class fits best and why, and what makes this case unusual.
+
+Rules:
+- Do not forecast this question and do not summarize current news.
+- Never report Metaculus community forecasts.
+- If no sensible reference class exists, say so in one sentence.
+- Keep it under 500 words."""
+
+# "high" runs openai/gpt-6-sol with web search and page fetching. Tried on a
+# practice question it found sharper base rates than "medium" (gpt-6-luna),
+# for about $0.14 per question against $0.07.
+PERPLEXITY_PRESET = "high"
+
+
+def question_brief(question: MetaculusQuestion) -> str:
+    """The question for a researcher. It leads, since it seeds the first search."""
+    resolves = (
+        question.scheduled_resolution_time.strftime("%Y-%m-%d")
+        if question.scheduled_resolution_time
+        else "unknown"
+    )
+    return (
+        f"{question.question_text}\n\n"
+        f"Resolution criteria: {question.resolution_criteria}\n\n"
+        f"{question.fine_print or ''}\n\n"
+        f"Today is {datetime.now():%Y-%m-%d}. "
+        f"The question is scheduled to resolve on {resolves}."
+    )
+
+
+async def ask_perplexity(instructions: str, question: MetaculusQuestion) -> str:
+    """Web research through Perplexity's Agent API (docs.perplexity.ai/docs/agent-api)."""
+    async with httpx.AsyncClient(timeout=300) as client:
+        response = await client.post(
+            "https://api.perplexity.ai/v1/agent",
+            headers={"Authorization": f"Bearer {os.environ['PERPLEXITY_API_KEY']}"},
+            json={
+                "preset": PERPLEXITY_PRESET,
+                "instructions": instructions,
+                "input": question_brief(question),
+                # Leaning on the Metaculus crowd forecast is against tournament rules.
+                "tools": [
+                    {
+                        "type": "web_search",
+                        "filters": {"search_domain_filter": ["-metaculus.com"]},
+                    }
+                ],
+            },
+        )
+    if response.status_code != 200:
+        raise RuntimeError(f"HTTP {response.status_code}: {response.text[:300]}")
+    data = response.json()
+    text = "".join(
+        part.get("text", "")
+        for item in data.get("output", [])
+        if item.get("type") == "message"
+        for part in item.get("content", [])
+    )
+    if not text:
+        raise RuntimeError(f"no answer (status {data.get('status')}): {data.get('error')}")
+    cost = data.get("usage", {}).get("cost", {}).get("total_cost")
+    logger.info(f"Perplexity research for {question.page_url} cost ${cost}")
+    return text
 
 
 class SummerTemplateBot2026(ForecastBot):
@@ -154,6 +242,9 @@ class SummerTemplateBot2026(ForecastBot):
     base_rate_researcher: GeneralLlm | None = None
     # Also pull news articles from AskNews, on top of the web search.
     use_asknews: bool = False
+    # Run the news and base-rate lookups on Perplexity, keeping the web-search
+    # models as the backup when it fails or its credit runs out.
+    use_perplexity: bool = False
 
     ##################################### RESEARCH #####################################
 
@@ -188,61 +279,37 @@ class SummerTemplateBot2026(ForecastBot):
             return ""
 
     async def _research_base_rates(self, question: MetaculusQuestion) -> str:
+        if self.use_perplexity:
+            try:
+                return await ask_perplexity(BASE_RATE_INSTRUCTIONS, question)
+            except Exception as e:
+                logger.warning(
+                    f"Perplexity base-rate research failed for {question.page_url}; "
+                    f"using the backup web search: {e}"
+                )
         if self.base_rate_researcher is None:
             return ""
-        resolves = (
-            question.scheduled_resolution_time.strftime("%Y-%m-%d")
-            if question.scheduled_resolution_time
-            else "unknown"
-        )
-        prompt = clean_indents(
-            f"""
-            You are an assistant to a superforecaster. Your job is the outside view: before anyone looks at the specifics of this question, how often do events like this one happen?
-
-            Question:
-            {question.question_text}
-
-            This question's outcome will be determined by the specific criteria below:
-            {question.resolution_criteria}
-
-            {question.fine_print}
-
-            Today is {datetime.now().strftime("%Y-%m-%d")}. The question is scheduled to resolve on {resolves}.
-
-            1. Name one to three reference classes: groups of past situations comparable to this one (for example "US midterm elections since 1946" or "monthly US CPI releases over the last 10 years").
-            2. For each, search for the historical record and give the base rate as a number with its source. Match the time window to this question: if it resolves in 3 months, say how often the outcome happens within a 3-month window. For numeric or date questions, give the typical values and how much they usually move over a period that long.
-            3. Say which reference class fits best and why, and note anything that makes this case unusual.
-
-            Do not forecast this question and do not summarize current news; another assistant covers the news. If no sensible reference class exists, say so in one sentence.
-            """
-        )
         try:
-            return await self.base_rate_researcher.invoke(prompt)
+            return await self.base_rate_researcher.invoke(
+                f"{BASE_RATE_INSTRUCTIONS}\n\n{question_brief(question)}"
+            )
         except Exception as e:
             # Base rates help but aren't essential; forecast on the news alone.
             logger.warning(f"Base-rate research failed for {question.page_url}: {e}")
             return ""
 
     async def _research_news(self, question: MetaculusQuestion) -> str:
+        if self.use_perplexity:
+            try:
+                return await ask_perplexity(NEWS_INSTRUCTIONS, question)
+            except Exception as e:
+                logger.warning(
+                    f"Perplexity news research failed for {question.page_url}; "
+                    f"using the backup web search: {e}"
+                )
         research = ""
         researcher = self.get_llm("researcher")
-
-        prompt = clean_indents(
-            f"""
-            You are an assistant to a superforecaster.
-            The superforecaster will give you a question they intend to forecast on.
-            To be a great assistant, you generate a concise but detailed rundown of the most relevant news, including if the question would resolve Yes or No based on current information.
-            You do not produce forecasts yourself.
-
-            Question:
-            {question.question_text}
-
-            This question's outcome will be determined by the specific criteria below:
-            {question.resolution_criteria}
-
-            {question.fine_print}
-            """
-        )
+        prompt = f"{NEWS_INSTRUCTIONS}\n\n{question_brief(question)}"
 
         if isinstance(researcher, GeneralLlm):
             research = await researcher.invoke(prompt)
@@ -838,6 +905,10 @@ def pick_llms(forecaster: str, providers: set[str]) -> dict:
     }
 
 
+def perplexity_configured() -> bool:
+    return _is_real_env("PERPLEXITY_API_KEY")
+
+
 def asknews_configured() -> bool:
     return _is_real_env("ASKNEWS_API_KEY") or (
         _is_real_env("ASKNEWS_CLIENT_ID") and _is_real_env("ASKNEWS_SECRET")
@@ -906,7 +977,8 @@ if __name__ == "__main__":
     print(
         f"Forecasting models: {', '.join(forecast_models)} "
         f"({forecasts_per_question} forecasts per question)\n"
-        f"Research: web search + base rates{' + AskNews' if asknews_configured() else ''}\n"
+        f"Research: {'Perplexity (web search as backup)' if perplexity_configured() else 'web search'}"
+        f" + base rates{' + AskNews' if asknews_configured() else ''}\n"
     )
 
     # The locked forecasting-tools (0.2.92) still points its "current" IDs at
@@ -932,6 +1004,7 @@ if __name__ == "__main__":
         template_bot.forecasters = [make_forecaster(m) for m in forecast_models]
     template_bot.base_rate_researcher = make_search_llm(providers)
     template_bot.use_asknews = asknews_configured()
+    template_bot.use_perplexity = perplexity_configured()
 
     # Per-mode tournament URL shown in the summary banner footer. These
     # piggyback on the forecasting_tools SDK constants and need updating
