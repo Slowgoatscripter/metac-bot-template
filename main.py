@@ -275,6 +275,7 @@ class SummerTemplateBot2026(ForecastBot):
             )
         except Exception as e:
             # A second news source helps but isn't essential.
+            RESEARCH_FAILURES["AskNews"] += 1
             logger.warning(f"AskNews research failed for {question.page_url}: {e}")
             return ""
 
@@ -283,6 +284,7 @@ class SummerTemplateBot2026(ForecastBot):
             try:
                 return await ask_perplexity(BASE_RATE_INSTRUCTIONS, question)
             except Exception as e:
+                RESEARCH_FAILURES["Perplexity"] += 1
                 logger.warning(
                     f"Perplexity base-rate research failed for {question.page_url}; "
                     f"using the backup web search: {e}"
@@ -295,6 +297,7 @@ class SummerTemplateBot2026(ForecastBot):
             )
         except Exception as e:
             # Base rates help but aren't essential; forecast on the news alone.
+            RESEARCH_FAILURES["base-rate search"] += 1
             logger.warning(f"Base-rate research failed for {question.page_url}: {e}")
             return ""
 
@@ -303,6 +306,7 @@ class SummerTemplateBot2026(ForecastBot):
             try:
                 return await ask_perplexity(NEWS_INSTRUCTIONS, question)
             except Exception as e:
+                RESEARCH_FAILURES["Perplexity"] += 1
                 logger.warning(
                     f"Perplexity news research failed for {question.page_url}; "
                     f"using the backup web search: {e}"
@@ -824,6 +828,40 @@ PROVIDERS = {
     "openai": ("OPENAI_API_KEY", "openai/gpt-4o-mini"),
 }
 
+# Research sources that quietly fall back to something weaker when they fail
+# (e.g. out of credits). Counted per run and reported by degraded_notice().
+RESEARCH_FAILURES = {"Perplexity": 0, "AskNews": 0, "base-rate search": 0}
+NOTICE_HOUR_UTC = 14  # one run a day (the one starting 14:00-14:19 UTC, ~8 AM in Montana) sends the notice
+
+
+def notify(title: str, body: str, priority: int = 4) -> None:
+    """Push to the owner's phone via ntfy if NTFY_TOPIC is set. Never raises."""
+    topic = os.environ.get("NTFY_TOPIC", "").strip()
+    if not topic:
+        return
+    try:
+        httpx.post("https://ntfy.sh", json={"topic": topic, "title": title, "message": body,
+                                             "priority": priority}, timeout=10).raise_for_status()
+    except Exception as e:  # an alert must never stop forecasting
+        logger.warning(f"Phone notice not sent ({type(e).__name__}): {title}")
+
+
+def degraded_notice(expected: set[str], working: set[str], now: datetime | None = None) -> str | None:
+    """Once a day, tell the owner if the bot ran degraded: a provider failing its
+    test call (bad key or no credits) or a research source failing. Such runs
+    still succeed, so nothing else would flag them. Returns the message sent."""
+    now = now or datetime.now(timezone.utc)
+    if now.hour != NOTICE_HOUR_UTC or now.minute >= 20:
+        return None
+    problems = [f"{name} failed its test call (bad key or out of credits)" for name in sorted(expected - working)]
+    problems += [f"{source} research failed {n} time(s) this run" for source, n in RESEARCH_FAILURES.items() if n]
+    if not problems:
+        return None
+    body = ("Still forecasting, but degraded: " + "; ".join(problems)
+            + f". Working providers: {', '.join(sorted(working)) or 'none'}. Check credits and keys.")
+    notify("Metaculus bot running degraded", body)
+    return body
+
 
 def working_providers() -> set[str]:
     """
@@ -955,6 +993,7 @@ if __name__ == "__main__":
     publish_to_metaculus = not args.dry_run
     print_startup_banner(run_mode, will_publish=publish_to_metaculus)
     providers = working_providers()
+    expected_providers = {name for name, (key_var, _) in PROVIDERS.items() if _is_real_env(key_var)}
     if not providers:
         raise SystemExit(
             "No AI provider passed the startup test (see errors above). "
@@ -1067,6 +1106,7 @@ if __name__ == "__main__":
                 )
             )
 
+    degraded_notice(expected_providers, providers)
     template_bot.log_report_summary(forecast_reports)
     print_run_summary_banner(
         forecast_reports,

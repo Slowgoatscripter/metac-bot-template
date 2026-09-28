@@ -54,3 +54,4 @@ jobs:
           ASKNEWS_CLIENT_ID: ${{ secrets.ASKNEWS_CLIENT_ID }}
           ASKNEWS_SECRET: ${{ secrets.ASKNEWS_SECRET }}
           ASKNEWS_API_KEY: ${{ secrets.ASKNEWS_API_KEY }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }} # optional: phone notice when running degraded
