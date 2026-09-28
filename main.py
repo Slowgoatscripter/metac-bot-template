@@ -2,8 +2,11 @@ import argparse
 import asyncio
 import logging
 import os
+import re
 from datetime import datetime, timezone
+from html.parser import HTMLParser
 from typing import Literal
+from urllib.parse import urlparse
 
 import dotenv
 import httpx
@@ -77,6 +80,87 @@ Rules:
 - Never report Metaculus community forecasts.
 - If no sensible reference class exists, say so in one sentence.
 - Keep it under 500 words."""
+
+RESOLUTION_SOURCE_INSTRUCTIONS = """You are a research assistant to a superforecaster. Below are the pages named in a forecasting question's resolution criteria, fetched today. Report what they show that bears on how the question will resolve; do not forecast.
+
+Cover:
+- The latest values, statuses or entries relevant to the question, each with its date or period.
+- How the question would resolve if it resolved on these pages as they stand now.
+- Anything about how the source reports that matters for resolution, such as its publishing schedule, revisions, units or rounding.
+
+Rules:
+- Use only what the pages say. If a page is empty or lacks the data (some need a browser to load), say so in one line.
+- Never report Metaculus community forecasts.
+- Keep it under 300 words."""
+
+# Pages a question names as its resolution source are read directly, not just
+# through what a search engine says about them.
+MAX_RESOLUTION_SOURCES = 3
+MAX_PAGE_CHARS = 30000
+URL_PATTERN = re.compile(r"https?://[^\s)\]>\"'<]+")
+BROWSER_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/140.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/json,text/plain,*/*",
+}
+
+
+def resolution_urls(question: MetaculusQuestion) -> list[str]:
+    """Links in the resolution criteria and fine print, Metaculus's own excluded."""
+    text = f"{question.resolution_criteria or ''}\n{question.fine_print or ''}"
+    urls: list[str] = []
+    for url in URL_PATTERN.findall(text):
+        url = url.rstrip(".,;:!?*")
+        parts = urlparse(url)
+        host = parts.netloc.lower()
+        # A bare site link ("see web.archive.org") points at a tool, not the data.
+        bare = parts.path in ("", "/") and not parts.query
+        if host and not bare and not host.endswith("metaculus.com") and url not in urls:
+            urls.append(url)
+    return urls[:MAX_RESOLUTION_SOURCES]
+
+
+class _PageText(HTMLParser):
+    SKIP = {"script", "style", "noscript", "svg", "head", "template", "nav", "header", "footer"}
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.parts: list[str] = []
+        self.skipping = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self.SKIP:
+            self.skipping += 1
+
+    def handle_endtag(self, tag):
+        if tag in self.SKIP and self.skipping:
+            self.skipping -= 1
+
+    def handle_data(self, data):
+        if not self.skipping and data.strip():
+            self.parts.append(" ".join(data.split()))
+
+
+def page_text(html: str) -> str:
+    parser = _PageText()
+    parser.feed(html)
+    return "\n".join(parser.parts)
+
+
+async def fetch_page(client: httpx.AsyncClient, url: str) -> str:
+    response = await client.get(url, follow_redirects=True)
+    response.raise_for_status()
+    kind = response.headers.get("content-type", "").split(";")[0].strip().lower()
+    if "html" in kind or "xml" in kind:
+        text = page_text(response.text)
+    elif kind.startswith("text/") or "json" in kind or "csv" in kind:
+        text = response.text
+    else:
+        raise ValueError(f"not a text page ({kind or 'unknown type'})")
+    if not text.strip():
+        raise ValueError("no readable text (the page may need a browser)")
+    return text[:MAX_PAGE_CHARS]
+
 
 # "high" runs openai/gpt-6-sol with web search and page fetching. Tried on a
 # practice question it found sharper base rates than "medium" (gpt-6-luna),
@@ -245,18 +329,22 @@ class SummerTemplateBot2026(ForecastBot):
     # Run the news and base-rate lookups on Perplexity, keeping the web-search
     # models as the backup when it fails or its credit runs out.
     use_perplexity: bool = False
+    # Read the pages the resolution criteria link to.
+    read_resolution_sources: bool = True
 
     ##################################### RESEARCH #####################################
 
     async def run_research(self, question: MetaculusQuestion) -> str:
         async with self._concurrency_limiter:
-            news, articles, base_rates = await asyncio.gather(
+            news, articles, base_rates, sources = await asyncio.gather(
                 self._research_news(question),
                 self._research_asknews(question),
                 self._research_base_rates(question),
+                self._research_resolution_sources(question),
             )
             sections = [
                 ("Base rates (how often things like this happen)", base_rates),
+                ("What the resolution source shows now", sources),
                 ("Current news about this question", news),
                 ("Recent news articles (AskNews)", articles),
             ]
@@ -265,6 +353,34 @@ class SummerTemplateBot2026(ForecastBot):
             )
             logger.info(f"Found Research for URL {question.page_url}:\n{research}")
             return research
+
+    async def _research_resolution_sources(self, question: MetaculusQuestion) -> str:
+        urls = resolution_urls(question) if self.read_resolution_sources else []
+        if not urls:
+            return ""
+        async with httpx.AsyncClient(timeout=30, headers=BROWSER_HEADERS) as client:
+            results = await asyncio.gather(
+                *(fetch_page(client, url) for url in urls), return_exceptions=True
+            )
+        pages = []
+        for url, result in zip(urls, results):
+            if isinstance(result, BaseException):
+                # Many sites block scripts; that's normal, not a failure to report.
+                logger.info(f"Resolution source {url} not read: {type(result).__name__}: {str(result)[:200]}")
+            else:
+                pages.append(f"### Page: {url}\n{result}")
+        if not pages:
+            return ""
+        prompt = (
+            f"{RESOLUTION_SOURCE_INSTRUCTIONS}\n\n# The question\n{question_brief(question)}"
+            f"\n\n# The pages\n\n" + "\n\n".join(pages)
+        )
+        try:
+            return await self.get_llm("summarizer", "llm").invoke(prompt)
+        except Exception as e:
+            RESEARCH_FAILURES["resolution-source reader"] += 1
+            logger.warning(f"Resolution-source reading failed for {question.page_url}: {e}")
+            return ""
 
     async def _research_asknews(self, question: MetaculusQuestion) -> str:
         if not self.use_asknews:
@@ -370,11 +486,12 @@ class SummerTemplateBot2026(ForecastBot):
             Today is {datetime.now().strftime("%Y-%m-%d")}.
 
             Before answering you write:
-            (a) The base rate: the reference class from your research assistant that fits this question best, and how often the outcome happens in it over a similar length of time.
-            (b) The time left until the outcome to the question is known.
-            (c) The status quo outcome if nothing changed.
-            (d) A brief description of a scenario that results in a No outcome.
-            (e) A brief description of a scenario that results in a Yes outcome.
+            (a) Exactly what has to happen for a Yes under the resolution criteria and fine print, read literally, including technicalities such as which source counts, the deadline and time zone, and thresholds.
+            (b) The base rate: the reference class from your research assistant that fits this question best, and how often the outcome happens in it over a similar length of time.
+            (c) The time left until the outcome to the question is known.
+            (d) The status quo outcome if nothing changed.
+            (e) A brief description of a scenario that results in a No outcome.
+            (f) A brief description of a scenario that results in a Yes outcome.
 
             You write your rationale remembering that good forecasters start from the base rate and adjust it for what is specific to this case, and put extra weight on the status quo outcome since the world changes slowly most of the time.
             {self._get_conditional_disclaimer_if_necessary(question)}
@@ -434,10 +551,11 @@ class SummerTemplateBot2026(ForecastBot):
             Today is {datetime.now().strftime("%Y-%m-%d")}.
 
             Before answering you write:
-            (a) The base rate: the reference class from your research assistant that fits this question best, and how often each kind of outcome happens in it.
-            (b) The time left until the outcome to the question is known.
-            (c) The status quo outcome if nothing changed.
-            (d) A description of an scenario that results in an unexpected outcome.
+            (a) Exactly how the resolution criteria and fine print, read literally, decide between the options, including technicalities such as which source counts and the deadline.
+            (b) The base rate: the reference class from your research assistant that fits this question best, and how often each kind of outcome happens in it.
+            (c) The time left until the outcome to the question is known.
+            (d) The status quo outcome if nothing changed.
+            (e) A description of an scenario that results in an unexpected outcome.
 
             {self._get_conditional_disclaimer_if_necessary(question)}
             You write your rationale remembering that (1) good forecasters start from the base rate and adjust it for what is specific to this case, (2) good forecasters put extra weight on the status quo outcome since the world changes slowly most of the time, and (3) good forecasters leave some moderate probability on most options to account for unexpected outcomes.
@@ -520,13 +638,14 @@ class SummerTemplateBot2026(ForecastBot):
             - Always start with a smaller number (more negative if negative) and then increase from there. The value for percentile 10 should always be less than the value for percentile 20, and so on.
 
             Before answering you write:
-            (a) The base rate: what the historical record from your research assistant says about typical outcomes and how much they usually move over a similar length of time.
-            (b) The time left until the outcome to the question is known.
-            (c) The outcome if nothing changed.
-            (d) The outcome if the current trend continued.
-            (e) The expectations of experts and markets.
-            (f) A brief description of an unexpected scenario that results in a low outcome.
-            (g) A brief description of an unexpected scenario that results in a high outcome.
+            (a) Exactly which number the resolution criteria and fine print, read literally, will use, including which source counts, the date or period, and units or revisions.
+            (b) The base rate: what the historical record from your research assistant says about typical outcomes and how much they usually move over a similar length of time.
+            (c) The time left until the outcome to the question is known.
+            (d) The outcome if nothing changed.
+            (e) The outcome if the current trend continued.
+            (f) The expectations of experts and markets.
+            (g) A brief description of an unexpected scenario that results in a low outcome.
+            (h) A brief description of an unexpected scenario that results in a high outcome.
 
             {self._get_conditional_disclaimer_if_necessary(question)}
             You remind yourself that good forecasters start from the base rate and adjust it for what is specific to this case, and that they are humble and set wide 90/10 confidence intervals to account for unknown unknowns.
@@ -614,13 +733,14 @@ class SummerTemplateBot2026(ForecastBot):
             - Do NOT forget this. The dates must be written in chronological order starting at the earliest time at percentile 10 and increasing from there.
 
             Before answering you write:
-            (a) The base rate: what the historical record from your research assistant says about typical outcomes and how much they usually move over a similar length of time.
-            (b) The time left until the outcome to the question is known.
-            (c) The outcome if nothing changed.
-            (d) The outcome if the current trend continued.
-            (e) The expectations of experts and markets.
-            (f) A brief description of an unexpected scenario that results in a low outcome.
-            (g) A brief description of an unexpected scenario that results in a high outcome.
+            (a) Exactly which event and date the resolution criteria and fine print, read literally, will use, including which source counts, the date or period, and units or revisions.
+            (b) The base rate: what the historical record from your research assistant says about typical outcomes and how much they usually move over a similar length of time.
+            (c) The time left until the outcome to the question is known.
+            (d) The outcome if nothing changed.
+            (e) The outcome if the current trend continued.
+            (f) The expectations of experts and markets.
+            (g) A brief description of an unexpected scenario that results in a low outcome.
+            (h) A brief description of an unexpected scenario that results in a high outcome.
 
             {self._get_conditional_disclaimer_if_necessary(question)}
             You remind yourself that good forecasters start from the base rate and adjust it for what is specific to this case, and that they are humble and set wide 90/10 confidence intervals to account for unknown unknowns.
@@ -813,8 +933,8 @@ class SummerTemplateBot2026(ForecastBot):
 
 def make_forecaster(model: str) -> GeneralLlm:
     kwargs: dict = {}
-    if model.startswith("anthropic/"):
-        # Claude needs room for its thinking plus the written answer.
+    if model.startswith(("anthropic/", "openrouter/")):
+        # Reasoning models need room for their thinking plus the written answer.
         kwargs["max_tokens"] = 16000
         if "opus-5-5" in model:
             # Opus 5.5 defaults to medium effort; forecasting deserves high.
@@ -826,11 +946,14 @@ def make_forecaster(model: str) -> GeneralLlm:
 PROVIDERS = {
     "anthropic": ("ANTHROPIC_API_KEY", "anthropic/claude-haiku-4-5"),
     "openai": ("OPENAI_API_KEY", "openai/gpt-4o-mini"),
+    # A third lab. Past winners took the median of models from three labs, and
+    # xAI's Grok is the best-scoring third lab on ForecastBench (Sep 2026).
+    "openrouter": ("OPENROUTER_API_KEY", "openrouter/openai/gpt-4o-mini"),
 }
 
 # Research sources that quietly fall back to something weaker when they fail
 # (e.g. out of credits). Counted per run and reported by degraded_notice().
-RESEARCH_FAILURES = {"Perplexity": 0, "AskNews": 0, "base-rate search": 0}
+RESEARCH_FAILURES = {"Perplexity": 0, "AskNews": 0, "base-rate search": 0, "resolution-source reader": 0}
 NOTICE_HOUR_UTC = 14  # one run a day (the one starting 14:00-14:19 UTC, ~8 AM in Montana) sends the notice
 
 
@@ -906,6 +1029,8 @@ def default_forecast_models(providers: set[str]) -> list[str]:
         models.append("anthropic/claude-opus-5-5")
     if "openai" in providers:
         models.append("openai/gpt-6-astra")
+    if "openrouter" in providers:
+        models.append("openrouter/x-ai/grok-4.7")
     return models
 
 
@@ -983,7 +1108,7 @@ if __name__ == "__main__":
         type=str,
         default=os.getenv("FORECAST_MODEL") or None,
         help="Forecasting model(s), comma-separated to take turns, e.g. "
-        "anthropic/claude-opus-5-5,openai/gpt-6-astra "
+        "anthropic/claude-opus-5-5,openai/gpt-6-astra,openrouter/x-ai/grok-4.7 "
         "(default: FORECAST_MODEL env var, else one model per provider key)",
     )
     args = parser.parse_args()
